@@ -1,8 +1,8 @@
 {
   "name": "pi-metaprompt",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Turn rough ideas into clarified, ready-to-paste prompts with /metaprompt in Pi.",
+  "description": "Clarify rough ideas into prompts, then respond, approve execution, or execute in Pi.",
   "type": "module",
   "scripts": {
     "test": "node --test metaprompt.test.mjs"
