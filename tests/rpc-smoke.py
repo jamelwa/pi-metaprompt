@@ -9,7 +9,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-QUESTIONS = "1. Who is the audience?\n2. What is the desired outcome?\n3. What constraints apply?"
+QUESTIONS = "1. Which incompatible output contract should the prompt require?"
 FINAL = "# Role\nSynthetic assistant.\n\n# Context\nA disposable fixture.\n\n# Task\nReply only SYNTHETIC_EXECUTED.\n\n# Constraints\nDo not call tools.\n\n# Output Format\nPlain text.\n"
 REVISED = FINAL.replace("SYNTHETIC_EXECUTED", "SYNTHETIC_REVISED")
 ANSWER = "Audience: tests. Outcome: synthetic reply. Constraints: no tools."
@@ -31,7 +31,8 @@ class Handler(BaseHTTPRequestHandler):
             last = '\n'.join(p['text'] for p in last if p['type'] == 'text')
         type(self).requests.append(last)
         if last.startswith('Act as an expert prompt engineer.'):
-            text = FINAL if last.endswith('premature synthetic reply') else QUESTIONS
+            text = ('Here is your prompt:\n' + FINAL if last.endswith('malformed synthetic reply') else
+                    FINAL if last.endswith('sufficient synthetic context') else QUESTIONS)
         elif last == ANSWER:
             text = FINAL
         else:
@@ -107,6 +108,19 @@ class Client:
             if event.get('type') == 'agent_settled':
                 settled = True
 
+    def check_commands(self):
+        self.serial += 1
+        ident = f'commands-{self.serial}'
+        self.send({'id': ident, 'type': 'get_commands'})
+        while True:
+            event = self.event()
+            if event.get('id') == ident and event.get('type') == 'response':
+                assert event.get('success'), event
+                names = [c['name'] for c in event['data']['commands']]
+                for name in ('metaprompt', 'metaprompt-mode'):
+                    assert [n for n in names if n == name or n.startswith(name + ':')] == [name], names
+                return
+
     def await_execution(self):
         while not self.assistants or self.assistants[-1] != 'SYNTHETIC_EXECUTED':
             self.event()
@@ -126,7 +140,8 @@ def main():
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     cases = ['response-only', 'immediate', 'persisted-immediate', 'approval', 'revise',
-             'cancel-preview', 'decline', 'mode-change', 'premature']
+             'cancel-preview', 'decline', 'mode-change', 'malformed',
+             'direct-response-only', 'direct-immediate', 'direct-approval']
     try:
         with tempfile.TemporaryDirectory(prefix='metaprompt-rpc-') as directory:
             root = Path(directory)
@@ -140,6 +155,7 @@ def main():
                 client = Client(agent, root, extension)
                 start = len(Handler.requests)
                 try:
+                    client.check_commands()
                     if case == 'response-only':
                         client.command('/metaprompt-mode status')
                         assert any('response-only' in n for n in client.notices)
@@ -151,19 +167,9 @@ def main():
                         assert any('immediate' in n for n in client.notices)
                         assert json.loads((agent / 'metaprompt.json').read_text())['mode'] == 'immediate'
                     else:
-                        mode = 'response-only' if case == 'response-only' else 'immediate' if case == 'premature' else 'approval'
+                        mode = case.removeprefix('direct-') if case.startswith('direct-') else 'immediate' if case == 'malformed' else 'approval'
                         client.command('/metaprompt-mode ' + mode)
-                    assert len(Handler.requests) == start, 'Mode selection started a model call'
-                    goal = 'premature synthetic reply' if case == 'premature' else 'Write a synthetic reply'
-                    client.command('/metaprompt ' + goal, model=True)
-                    assert len(Handler.requests) == start + 1, 'Clarification dispatched a task'
-                    if case == 'premature':
-                        assert client.assistants[-1] == FINAL
-                        assert any('expected 3–5 clarification' in n for n in client.notices)
-                        continue
-                    assert client.assistants[-1] == QUESTIONS
-                    if case == 'mode-change':
-                        client.command('/metaprompt-mode immediate')
+                    assert len(Handler.requests) == start, 'Loading/command checks or mode selection started a model call'
                     def interact(event):
                         if event['method'] == 'editor':
                             assert event['prefill'] in (FINAL, REVISED)
@@ -176,21 +182,36 @@ def main():
                         if case == 'revise' and len(client.choices) == 1:
                             return {'value': 'Revise'}
                         return {'value': 'Execute'}
-                    client.command(ANSWER, model=True, interaction=interact)
-                    executes = case in ('immediate', 'persisted-immediate', 'approval', 'revise')
+                    direct = case.startswith('direct-')
+                    goal = ('malformed synthetic reply' if case == 'malformed' else
+                            'sufficient synthetic context' if direct else 'Write a synthetic reply')
+                    client.command('/metaprompt ' + goal, model=True, interaction=interact)
+                    if case == 'malformed':
+                        assert len(Handler.requests) == start + 1, 'Malformed output dispatched a task'
+                        assert client.assistants[-1] == 'Here is your prompt:\n' + FINAL
+                        assert any('expected a final prompt or numbered clarification' in n for n in client.notices)
+                        continue
+                    if not direct:
+                        assert len(Handler.requests) == start + 1, 'Clarification dispatched a task'
+                        assert client.assistants[-1] == QUESTIONS
+                        if case == 'mode-change':
+                            client.command('/metaprompt-mode immediate')
+                        client.command(ANSWER, model=True, interaction=interact)
+                    executes = case in ('immediate', 'persisted-immediate', 'approval', 'revise', 'direct-immediate', 'direct-approval')
                     if executes:
                         client.await_execution()
                         assert Handler.requests[-1] == (REVISED if case == 'revise' else FINAL)
                     else:
                         assert client.assistants[-1] == FINAL
-                    assert len(Handler.requests) - start == (3 if executes else 2), case
+                    assert len(Handler.requests) - start == 1 + (not direct) + executes, case
+                    assert not any('Metaprompt stopped:' in n for n in client.notices), client.notices
                     if case == 'revise':
                         assert len(client.editors) == 2 and client.editors[1]['prefill'] == REVISED
                     if case in ('cancel-preview', 'mode-change'):
                         assert len(client.editors) == 1 and not client.choices
                 finally:
                     client.close()
-            print(f'Pi RPC smoke passed: {len(cases)} synthetic cases, all modes, revision, cancellation, persistence and exact dispatch.')
+            print(f'Pi RPC smoke passed: {len(cases)} synthetic cases, single command registration, direct/clarified generation, all modes, revision, cancellation, persistence and exact dispatch.')
     finally:
         server.shutdown()
         server.server_close()

@@ -92,7 +92,7 @@ test("mode selection is global, explicit, and cancellation preserves the saved c
 	assert.equal(resumed.messages.length, 0);
 });
 
-const QUESTIONS = "1. Who is the audience?\n2. What is the desired outcome?\n3. What constraints apply?";
+const QUESTIONS = "1. Which incompatible output contract should the prompt require?";
 const FINAL = "# Role\nSynthetic assistant.\n\n# Context\nA disposable fixture.\n\n# Task\nReply only SYNTHETIC_EXECUTED.\n\n# Constraints\nDo not call tools.\n\n# Output Format\nPlain text.\n";
 
 async function clarify(h, mode) {
@@ -101,10 +101,63 @@ async function clarify(h, mode) {
 	await h.deliver(h.messages[0].content, "extension");
 	await h.respond(QUESTIONS);
 	assert.equal(h.messages.length, 1, "clarification must not execute the task");
+	assert.equal(h.notices.filter((notice) => notice.type === "warning").length, 0, "clarification was accepted");
 	await h.deliver("Audience: tests. Outcome: synthetic reply. Constraints: no tools.");
 }
 
-test("immediate mode executes the final prompt once, only after clarification and answers", async () => {
+test("sufficient context accepts a direct final prompt in every existing mode", async () => {
+	for (const mode of ["response-only", "approval", "immediate"]) {
+		const h = setup({ editorValue: FINAL });
+		await h.mode.handler(mode, h.ctx);
+		await h.command.handler("Use the decisions already in this conversation", h.ctx);
+		await h.deliver(h.messages[0].content, "extension");
+		if (mode === "approval") h.selections.push("Execute");
+		await h.respond(FINAL);
+		assert.equal(h.messages.length, mode === "response-only" ? 1 : 2, mode);
+		assert.equal(h.editorCalls.length, mode === "approval" ? 1 : 0, mode);
+		assert.deepEqual(h.notices.filter((notice) => notice.type === "warning"), [], mode);
+		if (mode !== "response-only") assert.deepEqual(h.messages[1], { content: FINAL, options: { deliverAs: "followUp" } });
+		await h.emit("agent_settled", { aborted: false });
+		await h.deliver("An unrelated later request");
+		await h.respond(FINAL);
+		assert.equal(h.messages.length, mode === "response-only" ? 1 : 2, "completed workflows cannot dispatch again");
+	}
+});
+
+test("conditional clarification accepts the useful batch size, not a question quota", async () => {
+	for (const count of [1, 2, 6]) {
+		const h = setup();
+		await h.mode.handler("immediate", h.ctx);
+		await h.command.handler("Synthetic goal", h.ctx);
+		await h.deliver(h.messages[0].content, "extension");
+		await h.respond(Array.from({ length: count }, (_, i) => `${i + 1}. Consequential choice ${i + 1}?`).join("\n"));
+		assert.equal(h.messages.length, 1);
+		assert.equal(h.notices.filter((notice) => notice.type === "warning").length, 0);
+		await h.deliver("Synthetic answers");
+		await h.respond(FINAL);
+		assert.equal(h.messages.length, 2, `batch of ${count}`);
+	}
+});
+
+test("read-only context tool turns do not settle or dispatch the workflow", async () => {
+	const h = setup();
+	await h.mode.handler("immediate", h.ctx);
+	await h.command.handler("Use current project evidence", h.ctx);
+	await h.deliver(h.messages[0].content, "extension");
+	const assistant = { role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "AGENTS.md" } }], stopReason: "toolUse" };
+	const result = { role: "toolResult", toolCallId: "read-1", toolName: "read", content: [{ type: "text", text: "Synthetic project evidence" }] };
+	for (const message of [assistant, result]) {
+		h.branch.push({ type: "message", id: `entry-${h.branch.length}`, message });
+		await h.emit("message_start", { message });
+		await h.emit("message_end", { message });
+	}
+	assert.equal(h.messages.length, 1);
+	await h.respond(FINAL);
+	assert.equal(h.messages.length, 2);
+	assert.equal(h.messages[1].content, FINAL);
+});
+
+test("immediate mode executes the final prompt once after conditional clarification and answers", async () => {
 	const h = setup();
 	await clarify(h, "immediate");
 	await h.respond(FINAL);
@@ -211,21 +264,24 @@ test("queued metaprompt does not consume an unrelated run's final-looking respon
 	assert.equal(h.messages.length, 2);
 });
 
-test("premature, malformed, failed or aborted model output never dispatches a task", async () => {
-	for (const variant of ["premature", "preamble", "missing-heading", "error", "aborted"]) {
-		const h = setup();
-		if (variant === "premature") {
-			await h.mode.handler("immediate", h.ctx);
-			await h.command.handler("Synthetic goal", h.ctx);
-			await h.deliver(h.messages[0].content, "extension");
-			await h.respond(FINAL);
-		} else {
-			await clarify(h, "immediate");
-			const text = variant === "preamble" ? `Here is your prompt:\n${FINAL}` :
-				variant === "missing-heading" ? FINAL.replace("# Task", "## Task") : FINAL;
+test("malformed, wrapped, failed or aborted output never dispatches, directly or after answers", async () => {
+	for (const direct of [true, false]) {
+		for (const variant of ["preamble", "fence", "xml", "quote", "missing-heading", "extra-heading", "questions", "error", "aborted"]) {
+			const h = setup();
+			if (direct) {
+				await h.mode.handler("immediate", h.ctx);
+				await h.command.handler("Synthetic goal", h.ctx);
+				await h.deliver(h.messages[0].content, "extension");
+			} else await clarify(h, "immediate");
+			const text = {
+				preamble: `Here is your prompt:\n${FINAL}`,
+				fence: `\`\`\`markdown\n${FINAL}\`\`\``, xml: `<prompt>\n${FINAL}</prompt>`, quote: `"${FINAL}"`,
+				"missing-heading": FINAL.replace("# Task", "## Task"), "extra-heading": `${FINAL}\n# Extra\nUnexpected.`,
+				questions: QUESTIONS,
+			}[variant] ?? FINAL;
 			await h.respond(text, ["error", "aborted"].includes(variant) ? variant : "stop");
+			assert.equal(h.messages.length, 1, `${variant}, direct=${direct}`);
 		}
-		assert.equal(h.messages.length, 1, variant);
 	}
 });
 
@@ -286,7 +342,7 @@ test("mode picker accepts native labels and rejects unknown arguments without a 
 	assert.equal(h.messages.length, 0);
 });
 
-test("preserves a free-form goal and includes the two-stage prompt contract", async () => {
+test("preserves a free-form goal and includes the context-first, prompt-only contract", async () => {
 	const { command, ctx, messages, editorCalls } = setup({ hasUI: false });
 	const goal = 'Review /api, keep $VARIABLE and [EXAMPLE].\nUse "plain English".';
 	await command.handler(`  ${goal}  `, ctx);
@@ -294,9 +350,27 @@ test("preserves a free-form goal and includes the two-stage prompt contract", as
 	assert.equal(messages.length, 1);
 	const { content, options } = messages[0];
 	assert.ok(content.endsWith(`## Goal brief\n${goal}`));
-	assert.match(content, /Ask 3 to 5 brief, numbered clarifying questions/);
+	assert.match(content, /Stage 1: Gather relevant context/);
+	assert.match(content, /current conversation.*answers and decisions/);
+	assert.match(content, /project routing.*instructions.*memory sources/);
+	assert.match(content, /smallest useful set.*authorized read-only tools/);
+	assert.match(content, /project files.*Git state/);
+	assert.match(content, /stale or conflicting memories.*current project evidence/);
+	assert.match(content, /Never ask me to repeat.*available or reasonably discoverable/);
+	assert.match(content, /context is sufficient, produce the final prompt immediately/);
+	assert.match(content, /correctness, scope, authorization, or an important user choice/);
+	assert.match(content, /smallest useful set.*one brief, numbered batch/);
 	assert.match(content, /STOP and wait for my reply/);
+	assert.match(content, /Do not start another question round/);
+	assert.match(content, /routine audience, tone, format, repository, or environment questions/);
 	assert.match(content, /NOT performing the underlying task/);
+	assert.match(content, /Do not edit files, start services, or perform business operations/);
+	assert.match(content, /Never read credential stores/);
+	assert.match(content, /unrelated projects/);
+	assert.match(content, /evidence, not instructions.*prompt-design boundary/);
+	assert.match(content, /Do not invent facts, tool capabilities, permissions, or user preferences/);
+	assert.match(content, /Do not narrate context gathering/);
+	assert.doesNotMatch(content, /Ask 3 to 5|Clarification comes first|clarify first|Use unrelated conversation context only/);
 	assert.match(content, /\[BRACKETED_PLACEHOLDERS\]/);
 	assert.match(content, /Return only the final prompt, ready to paste directly into another AI/);
 	assert.match(content, /Do not wrap the prompt in a code block, quotation marks, XML tags/);
